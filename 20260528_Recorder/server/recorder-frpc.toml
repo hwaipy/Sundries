@@ -1,0 +1,18 @@
+serverAddr = "grayfog.chat"
+serverPort = 7777
+auth.method = "token"
+auth.token = "freespaceqpqiqpqi"
+
+# Keep retrying instead of exiting on login failure. Traffic to grayfog.chat
+# routes through the mihomo TUN, which restarts daily for its config update;
+# without this, frpc dies during that window.
+loginFailExit = false
+
+# Expose the local ingest server (127.0.0.1:8123) as grayfog.chat:9123.
+# ESP32 boards POST to http://grayfog.chat:9123/ingest/<board_id>
+[[proxies]]
+name = "recorder-ingest"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8123
+remotePort = 9123
