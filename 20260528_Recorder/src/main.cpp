@@ -2,6 +2,9 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include "driver/adc.h"   // ESP-IDF 4.4 continuous (DMA) ADC for gap-free sampling
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 
 // =================== user config ===================
 // WiFi networks tried strictly in this order, each with WIFI_CONN_TIMEOUT_MS.
@@ -29,7 +32,14 @@ static const WifiCred WIFI_LIST[] = {
 // Continuous ADC (DMA) sampling. The DMA pool keeps filling at SAMPLE_RATE_HZ
 // regardless of upload state, so a slow/stalled POST no longer creates a gap.
 #define MIC_ADC_CHANNEL  ADC1_CHANNEL_6   // GPIO7 = ADC1_CH6 (keep in sync with MIC_OUT_PIN)
-#define ADC_DMA_SECONDS  2                 // DMA buffer depth; absorbs upload stalls up to this long
+#define ADC_DMA_SECONDS  1                 // hardware DMA pool depth (seconds of audio)
+
+// Producer/consumer decoupling: the ADC reader task drains the DMA pool into
+// this many app-level batch buffers; the uploader task drains those over HTTP.
+// A slow/stalled POST only grows this backlog instead of starving the ADC, so
+// sampling runs at 100% duty. Backlog tolerance = NUM_BATCH_BUFS * BATCH_MS
+// (plus the hardware DMA pool). When full, the oldest batch is dropped.
+#define NUM_BATCH_BUFS   16                // 16 * 250ms = 4s of upload-stall slack
 
 // Debug: when 1, skip WiFi/upload entirely and stream GPIO7 over serial as
 // "P <mean> <min> <max>" at ~100Hz for the local web plot (webgui/serial_plot.py).
@@ -39,14 +49,24 @@ static const WifiCred WIFI_LIST[] = {
 
 // Samples per batch and bytes (uint16 little-endian per sample).
 static const size_t BATCH_SAMPLES = (size_t)SAMPLE_RATE_HZ * BATCH_MS / 1000;
-static uint16_t g_buf[BATCH_SAMPLES];
+
+// Pool of fixed-size batch buffers cycled between the two queues below. A buffer
+// is always in exactly one place: g_freeQ (empty), g_readyQ (filled, awaiting
+// upload), being filled by the reader, or being POSTed by the uploader.
+static uint16_t g_pool[NUM_BATCH_BUFS][BATCH_SAMPLES];
+static QueueHandle_t g_freeQ;    // holds uint16_t* to empty buffers
+static QueueHandle_t g_readyQ;   // holds uint16_t* to filled buffers
 
 static String g_boardId;
-static uint32_t g_seq = 0;
 static String g_url;
 
-static WiFiClient g_client;
-static HTTPClient g_http;
+// Cross-task stats (32-bit aligned -> atomic enough on Xtensa for reporting).
+static volatile uint32_t g_seq = 0;          // owned by uploader
+static volatile uint32_t g_okCount = 0;      // owned by uploader
+static volatile uint32_t g_failCount = 0;    // owned by uploader
+static volatile uint32_t g_dropCount = 0;    // owned by reader: app-buffer overruns
+static volatile uint32_t g_hwOverflow = 0;   // owned by reader: DMA pool overruns
+static volatile uint16_t g_mn = 0, g_mx = 0, g_mean = 0;  // owned by uploader
 
 // Unique per-board ID derived from the factory eFuse MAC (48-bit).
 static String deriveBoardId() {
@@ -146,14 +166,17 @@ static void connectWiFi() {
   }
 }
 
-static bool uploadBatch(const uint8_t *data, size_t len) {
-  g_http.begin(g_client, g_url);
-  g_http.setReuse(true);
-  g_http.addHeader("Content-Type", "application/octet-stream");
-  g_http.addHeader("X-Seq", String(g_seq));
-  g_http.addHeader("X-Sample-Rate", String(SAMPLE_RATE_HZ));
-  int code = g_http.POST((uint8_t *)data, len);
-  g_http.end();
+// POST one batch. Runs only on the uploader task, so a slow/stalled request
+// blocks nothing but itself -- the reader keeps sampling meanwhile.
+static bool uploadBatch(HTTPClient &http, WiFiClient &client,
+                        const uint8_t *data, size_t len) {
+  http.begin(client, g_url);
+  http.setReuse(true);
+  http.addHeader("Content-Type", "application/octet-stream");
+  http.addHeader("X-Seq", String(g_seq));
+  http.addHeader("X-Sample-Rate", String(SAMPLE_RATE_HZ));
+  int code = http.POST((uint8_t *)data, len);
+  http.end();
   if (code == 200) return true;
   Serial.printf("[upload] seq=%lu HTTP %d\n", (unsigned long)g_seq, code);
   return false;
@@ -163,9 +186,9 @@ static bool uploadBatch(const uint8_t *data, size_t len) {
 static const size_t ADC_RESULT_BYTES = sizeof(adc_digi_output_data_t);
 
 // Start ADC1 continuous (DMA) sampling of MIC_ADC_CHANNEL at SAMPLE_RATE_HZ.
-// The driver fills an internal pool via DMA/IRQ in the background; loop() just
-// drains it. Pool size = ADC_DMA_SECONDS of audio, so uploads can stall that
-// long without losing a single sample.
+// The driver fills an internal pool via DMA/IRQ in the background; the reader
+// task drains it. Pool size = ADC_DMA_SECONDS of audio; the app-level backlog
+// (NUM_BATCH_BUFS) absorbs longer upload stalls on top of that.
 static void adcDmaInit() {
   adc_digi_init_config_t init_cfg = {};
   init_cfg.max_store_buf_size =
@@ -192,6 +215,70 @@ static void adcDmaInit() {
   ESP_ERROR_CHECK(adc_digi_start());
 }
 
+// Producer: drain the DMA pool into app batch buffers, never touching the
+// network. The only blocking call is adc_digi_read_bytes, which sleeps the task
+// until DMA data is ready. When the uploader can't keep up and no free buffer is
+// available, the oldest queued batch is reclaimed (dropped) so sampling never
+// stalls -- this is the only path that can lose samples, and it is counted.
+static void adcReaderTask(void *) {
+  static uint8_t rd[BATCH_SAMPLES * 4];  // scratch for raw DMA results (4B each)
+  uint16_t *cur = nullptr;
+  size_t fill = 0;
+
+  for (;;) {
+    if (!cur) {
+      if (xQueueReceive(g_freeQ, &cur, 0) != pdTRUE) {
+        // Uploader is backed up: drop the oldest filled batch to free a buffer.
+        if (xQueueReceive(g_readyQ, &cur, 0) == pdTRUE) g_dropCount++;
+        else { vTaskDelay(1); continue; }  // momentary; should not happen
+      }
+      fill = 0;
+    }
+
+    uint32_t got = 0;
+    esp_err_t r = adc_digi_read_bytes(rd, sizeof(rd), &got, portMAX_DELAY);
+    if (r == ESP_ERR_INVALID_STATE) g_hwOverflow++;  // DMA pool overran
+    if (got == 0) continue;
+
+    for (uint32_t i = 0; i + ADC_RESULT_BYTES <= got; i += ADC_RESULT_BYTES) {
+      adc_digi_output_data_t *p = (adc_digi_output_data_t *)&rd[i];
+      if (p->type2.channel != MIC_ADC_CHANNEL) continue;  // ignore stray channels
+      cur[fill++] = p->type2.data;
+      if (fill >= BATCH_SAMPLES) {
+        xQueueSend(g_readyQ, &cur, 0);  // length == pool size -> never blocks
+        cur = nullptr;
+        fill = 0;
+        break;  // grab a fresh buffer on the next outer iteration
+      }
+    }
+  }
+}
+
+// Consumer: pull filled batches and POST them. A slow request only lets the
+// backlog grow; it cannot stall the reader.
+static void uploaderTask(void *) {
+  WiFiClient client;
+  HTTPClient http;
+  uint16_t *buf = nullptr;
+
+  for (;;) {
+    if (xQueueReceive(g_readyQ, &buf, portMAX_DELAY) != pdTRUE) continue;
+
+    uint16_t mn, mx, mean;
+    batchStats(buf, BATCH_SAMPLES, &mn, &mx, &mean);
+    g_mn = mn; g_mx = mx; g_mean = mean;
+
+    if (uploadBatch(http, client, (uint8_t *)buf, BATCH_SAMPLES * 2)) {
+      g_okCount++; g_seq++;
+    } else {
+      g_failCount++;
+    }
+
+    xQueueSend(g_freeQ, &buf, portMAX_DELAY);  // return buffer to the free pool
+    buf = nullptr;
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -214,10 +301,29 @@ void setup() {
   Serial.printf("[boot] rate=%dHz batch=%dms (%u samples / %u bytes)\n",
                 SAMPLE_RATE_HZ, BATCH_MS, (unsigned)BATCH_SAMPLES,
                 (unsigned)(BATCH_SAMPLES * 2));
-  adcDmaInit();
-  Serial.printf("[boot] ADC DMA started: %dHz continuous, %ds buffer\n",
-                SAMPLE_RATE_HZ, ADC_DMA_SECONDS);
+
   connectWiFi();
+
+  // Build the buffer pool + queues, then start sampling so no DMA data is
+  // produced before there is somewhere to put it.
+  g_freeQ = xQueueCreate(NUM_BATCH_BUFS, sizeof(uint16_t *));
+  g_readyQ = xQueueCreate(NUM_BATCH_BUFS, sizeof(uint16_t *));
+  configASSERT(g_freeQ && g_readyQ);
+  for (int i = 0; i < NUM_BATCH_BUFS; i++) {
+    uint16_t *p = g_pool[i];
+    xQueueSend(g_freeQ, &p, 0);
+  }
+
+  adcDmaInit();
+  Serial.printf("[boot] ADC DMA started: %dHz continuous, %ds pool, "
+                "%d-batch backlog (%ums slack)\n",
+                SAMPLE_RATE_HZ, ADC_DMA_SECONDS, NUM_BATCH_BUFS,
+                (unsigned)(NUM_BATCH_BUFS * BATCH_MS));
+
+  // Reader pinned to core 1 (APP_CPU) at high priority so DMA drains promptly;
+  // uploader on core 0 (PRO_CPU) alongside the WiFi stack since it is I/O-bound.
+  xTaskCreatePinnedToCore(adcReaderTask, "adcReader", 4096, nullptr, 10, nullptr, 1);
+  xTaskCreatePinnedToCore(uploaderTask, "uploader", 8192, nullptr, 5, nullptr, 0);
 }
 
 void loop() {
@@ -225,48 +331,20 @@ void loop() {
   debugPlotLoop();
   return;
 #endif
-  static uint32_t okCount = 0, failCount = 0, overflow = 0;
-  static uint32_t lastReport = 0;
-  static uint16_t mn = 0, mx = 0, mean = 0;
-  static size_t fill = 0;
-  static uint8_t rd[BATCH_SAMPLES * 4];  // 4 bytes per DMA result on the S3
-
-  // Once running we expect to stay connected; if the link drops, reboot so the
-  // whole startup (incl. the ordered WiFi reconnect) runs clean from scratch.
+  // Sampling + upload run in their own tasks now; loop() just watches the link
+  // and reports. If WiFi drops, reboot so the whole ordered reconnect runs clean.
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[wifi] connection lost -> restarting");
     delay(100);
     ESP.restart();
   }
 
-  // Drain one batch from the DMA pool. adc_digi_read_bytes sleeps this task
-  // (no busy-wait) until a batch is ready; the DMA keeps sampling during the
-  // POST below, so backlog accumulates in the pool instead of becoming a gap.
-  uint32_t got = 0;
-  esp_err_t r = adc_digi_read_bytes(rd, sizeof(rd), &got, 1000);
-  if (r == ESP_ERR_TIMEOUT && got == 0) return;  // no samples yet
-  if (r == ESP_ERR_INVALID_STATE) overflow++;    // pool overran (long stall)
-
-  for (uint32_t i = 0; i + ADC_RESULT_BYTES <= got; i += ADC_RESULT_BYTES) {
-    adc_digi_output_data_t *p = (adc_digi_output_data_t *)&rd[i];
-    if (p->type2.channel != MIC_ADC_CHANNEL) continue;  // ignore stray channels
-    g_buf[fill++] = p->type2.data;
-    if (fill >= BATCH_SAMPLES) {
-      batchStats(g_buf, BATCH_SAMPLES, &mn, &mx, &mean);
-      if (uploadBatch((uint8_t *)g_buf, BATCH_SAMPLES * 2)) { okCount++; g_seq++; }
-      else failCount++;
-      fill = 0;
-    }
-  }
-
-  uint32_t now = millis();
-  if (now - lastReport >= 2000) {
-    lastReport = now;
-    Serial.printf("[stat] seq=%lu ok=%lu fail=%lu ovf=%lu rssi=%d heap=%lu | "
-                  "adc min=%u max=%u mean=%u pp=%u\n",
-                  (unsigned long)g_seq, (unsigned long)okCount,
-                  (unsigned long)failCount, (unsigned long)overflow, WiFi.RSSI(),
-                  (unsigned long)ESP.getFreeHeap(),
-                  mn, mx, mean, (unsigned)(mx - mn));
-  }
+  Serial.printf("[stat] seq=%lu ok=%lu fail=%lu drop=%lu hwovf=%lu rssi=%d heap=%lu | "
+                "adc min=%u max=%u mean=%u pp=%u\n",
+                (unsigned long)g_seq, (unsigned long)g_okCount,
+                (unsigned long)g_failCount, (unsigned long)g_dropCount,
+                (unsigned long)g_hwOverflow, WiFi.RSSI(),
+                (unsigned long)ESP.getFreeHeap(),
+                g_mn, g_mx, g_mean, (unsigned)(g_mx - g_mn));
+  delay(2000);
 }
