@@ -1,16 +1,40 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include "driver/adc.h"   // ESP-IDF 4.4 continuous (DMA) ADC for gap-free sampling
 
 // =================== user config ===================
-#define WIFI_SSID      "2433"
-#define WIFI_PASS      "freespace"
+// WiFi networks tried strictly in this order, each with WIFI_CONN_TIMEOUT_MS.
+// If none connect, the list is retried from the top, looping until one does.
+// Empty-SSID slots are skipped.
+struct WifiCred { const char *ssid; const char *pass; };
+static const WifiCred WIFI_LIST[] = {
+  {"DDX",          "18817308954"},   // #1
+  {"沙包大的沙包",  "123qweasdzxc"},   // #2
+  {"2433",         "freespace"},      // #3
+};
+#define WIFI_CONN_TIMEOUT_MS 10000    // per-network connect timeout
 
 #define SERVER_HOST    "grayfog.chat"
 #define SERVER_PORT    9123
 
 #define SAMPLE_RATE_HZ 10000   // samples per second (ADC rate)
 #define BATCH_MS       250     // milliseconds of data per upload
+
+// MAX9814 electret mic amplifier wiring.
+#define MIC_OUT_PIN    7       // OUT -> GPIO7 = ADC1_CH6 (WiFi-safe; ADC1 only)
+#define MIC_GAIN_PIN   14      // GAIN select pin (driven digital / left hi-Z)
+#define MIC_GAIN_DB    50      // 40 = GAIN->VDD, 50 = GAIN->GND, 60 = GAIN floating
+
+// Continuous ADC (DMA) sampling. The DMA pool keeps filling at SAMPLE_RATE_HZ
+// regardless of upload state, so a slow/stalled POST no longer creates a gap.
+#define MIC_ADC_CHANNEL  ADC1_CHANNEL_6   // GPIO7 = ADC1_CH6 (keep in sync with MIC_OUT_PIN)
+#define ADC_DMA_SECONDS  2                 // DMA buffer depth; absorbs upload stalls up to this long
+
+// Debug: when 1, skip WiFi/upload entirely and stream GPIO7 over serial as
+// "P <mean> <min> <max>" at ~100Hz for the local web plot (webgui/serial_plot.py).
+// Set back to 0 and reflash to resume the recorder/upload behavior.
+#define DEBUG_PLOT     0
 // ===================================================
 
 // Samples per batch and bytes (uint16 little-endian per sample).
@@ -35,30 +59,90 @@ static String deriveBoardId() {
   return String(out);
 }
 
-// Data source. TODO: replace with real ADC ring-buffer drain once the
-// hardware sampling path works. For now: simulated 12-bit ADC noise.
-static void fillSamples(uint16_t *buf, size_t n) {
-  for (size_t i = 0; i < n; i++) {
-    buf[i] = (uint16_t)(esp_random() & 0x0FFF);  // 0..4095
-  }
+// Select MAX9814 gain via the GAIN pin's three states.
+//   GAIN -> VDD = 40dB, GAIN -> GND = 50dB, GAIN floating = 60dB.
+static void setMicGain() {
+#if MIC_GAIN_DB == 40
+  pinMode(MIC_GAIN_PIN, OUTPUT);
+  digitalWrite(MIC_GAIN_PIN, HIGH);
+#elif MIC_GAIN_DB == 50
+  pinMode(MIC_GAIN_PIN, OUTPUT);
+  digitalWrite(MIC_GAIN_PIN, LOW);
+#else  // 60dB: leave the pin floating (high-impedance input).
+  pinMode(MIC_GAIN_PIN, INPUT);
+#endif
 }
 
+// Quick batch stats so the mic can be verified from the serial log alone,
+// even with no ingest server running. A silent batch sits near the DC bias
+// with a small spread; sound widens min..max noticeably.
+static void batchStats(const uint16_t *buf, size_t n,
+                       uint16_t *mn, uint16_t *mx, uint16_t *mean) {
+  uint16_t lo = 0xFFFF, hi = 0;
+  uint64_t sum = 0;
+  for (size_t i = 0; i < n; i++) {
+    uint16_t v = buf[i];
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+    sum += v;
+  }
+  *mn = lo;
+  *mx = hi;
+  *mean = (uint16_t)(sum / (n ? n : 1));
+}
+
+#if DEBUG_PLOT
+// Stream GPIO7 over serial for the web plot: ~100 windows/sec, each window is
+// 10ms of samples reduced to mean/min/max. Line format: "P <mean> <min> <max>".
+static void debugPlotLoop() {
+  const uint32_t period_us = 1000000UL / SAMPLE_RATE_HZ;
+  const size_t WIN = SAMPLE_RATE_HZ / 100;  // 10ms worth of samples
+  uint32_t sum = 0;
+  uint16_t mn = 0xFFFF, mx = 0;
+  uint32_t t = micros();
+  for (size_t i = 0; i < WIN; i++) {
+    uint16_t v = (uint16_t)analogRead(MIC_OUT_PIN);
+    sum += v;
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+    t += period_us;
+    int32_t wait = (int32_t)(t - micros());
+    if (wait > 0) delayMicroseconds((uint32_t)wait);
+  }
+  Serial.printf("P %u %u %u\n", (unsigned)(sum / WIN), mn, mx);
+}
+#endif
+
+// Try each configured network in order, each up to WIFI_CONN_TIMEOUT_MS.
+// Loops over the whole list repeatedly and only returns once connected.
 static void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
-  Serial.printf("[wifi] connecting to %s ...\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-    delay(250);
-    Serial.print('.');
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("[wifi] connected, ip=%s rssi=%d\n",
-                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
-  } else {
-    Serial.println("[wifi] connect timeout, will retry");
+  const size_t n = sizeof(WIFI_LIST) / sizeof(WIFI_LIST[0]);
+  uint32_t round = 0;
+  while (true) {
+    for (size_t i = 0; i < n; i++) {
+      if (WIFI_LIST[i].ssid[0] == '\0') continue;  // skip empty slot
+      Serial.printf("[wifi] try #%u %s ...\n", (unsigned)(i + 1), WIFI_LIST[i].ssid);
+      WiFi.disconnect();
+      WiFi.begin(WIFI_LIST[i].ssid, WIFI_LIST[i].pass);
+      uint32_t start = millis();
+      while (WiFi.status() != WL_CONNECTED &&
+             millis() - start < WIFI_CONN_TIMEOUT_MS) {
+        delay(250);
+        Serial.print('.');
+      }
+      Serial.println();
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("[wifi] connected ssid=%s ip=%s rssi=%d\n",
+                      WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(),
+                      WiFi.RSSI());
+        return;
+      }
+      Serial.printf("[wifi] #%u timeout\n", (unsigned)(i + 1));
+    }
+    Serial.printf("[wifi] none connected (round %lu), retrying list ...\n",
+                  (unsigned long)(++round));
   }
 }
 
@@ -75,47 +159,114 @@ static bool uploadBatch(const uint8_t *data, size_t len) {
   return false;
 }
 
+// Each DMA conversion result is one of these (4 bytes on the ESP32-S3).
+static const size_t ADC_RESULT_BYTES = sizeof(adc_digi_output_data_t);
+
+// Start ADC1 continuous (DMA) sampling of MIC_ADC_CHANNEL at SAMPLE_RATE_HZ.
+// The driver fills an internal pool via DMA/IRQ in the background; loop() just
+// drains it. Pool size = ADC_DMA_SECONDS of audio, so uploads can stall that
+// long without losing a single sample.
+static void adcDmaInit() {
+  adc_digi_init_config_t init_cfg = {};
+  init_cfg.max_store_buf_size =
+      (uint32_t)(SAMPLE_RATE_HZ * ADC_DMA_SECONDS * ADC_RESULT_BYTES);
+  init_cfg.conv_num_each_intr = 1024;
+  init_cfg.adc1_chan_mask = (uint16_t)BIT(MIC_ADC_CHANNEL);
+  init_cfg.adc2_chan_mask = 0;
+  ESP_ERROR_CHECK(adc_digi_initialize(&init_cfg));
+
+  static adc_digi_pattern_config_t pat = {};
+  pat.atten = ADC_ATTEN_DB_12;   // ~0..3.1V full-scale (was ADC_ATTEN_DB_11)
+  pat.channel = MIC_ADC_CHANNEL;
+  pat.unit = 0;                  // digi pattern wants 0=ADC1 (enum ADC_UNIT_1==1 means ADC2 here)
+  pat.bit_width = SOC_ADC_DIGI_MAX_BITWIDTH;  // S3 digi controller = 12-bit
+
+  adc_digi_configuration_t dig_cfg = {};
+  dig_cfg.conv_limit_en = false;
+  dig_cfg.pattern_num = 1;
+  dig_cfg.adc_pattern = &pat;
+  dig_cfg.sample_freq_hz = SAMPLE_RATE_HZ;
+  dig_cfg.conv_mode = ADC_CONV_SINGLE_UNIT_1;
+  dig_cfg.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
+  ESP_ERROR_CHECK(adc_digi_controller_configure(&dig_cfg));
+  ESP_ERROR_CHECK(adc_digi_start());
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println();
+  setMicGain();
+
   g_boardId = deriveBoardId();
   g_url = String("http://") + SERVER_HOST + ":" + SERVER_PORT + "/ingest/" + g_boardId;
   Serial.printf("[boot] board=%s\n", g_boardId.c_str());
+  Serial.printf("[boot] mic out=GPIO%d (ADC1) gain=GPIO%d (%ddB)\n",
+                MIC_OUT_PIN, MIC_GAIN_PIN, MIC_GAIN_DB);
+#if DEBUG_PLOT
+  // analogRead path for the web plot.
+  analogReadResolution(12);
+  analogSetPinAttenuation(MIC_OUT_PIN, ADC_11db);
+  Serial.println("[boot] DEBUG_PLOT mode: streaming GPIO7, WiFi/upload disabled");
+  return;  // skip WiFi setup; loop() streams ADC for the web plot
+#endif
   Serial.printf("[boot] url=%s\n", g_url.c_str());
   Serial.printf("[boot] rate=%dHz batch=%dms (%u samples / %u bytes)\n",
                 SAMPLE_RATE_HZ, BATCH_MS, (unsigned)BATCH_SAMPLES,
                 (unsigned)(BATCH_SAMPLES * 2));
+  adcDmaInit();
+  Serial.printf("[boot] ADC DMA started: %dHz continuous, %ds buffer\n",
+                SAMPLE_RATE_HZ, ADC_DMA_SECONDS);
   connectWiFi();
 }
 
 void loop() {
-  static uint32_t nextBatch = 0;
-  static uint32_t okCount = 0, failCount = 0;
+#if DEBUG_PLOT
+  debugPlotLoop();
+  return;
+#endif
+  static uint32_t okCount = 0, failCount = 0, overflow = 0;
   static uint32_t lastReport = 0;
+  static uint16_t mn = 0, mx = 0, mean = 0;
+  static size_t fill = 0;
+  static uint8_t rd[BATCH_SAMPLES * 4];  // 4 bytes per DMA result on the S3
 
+  // Once running we expect to stay connected; if the link drops, reboot so the
+  // whole startup (incl. the ordered WiFi reconnect) runs clean from scratch.
   if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
-    return;
+    Serial.println("[wifi] connection lost -> restarting");
+    delay(100);
+    ESP.restart();
   }
 
-  uint32_t now = millis();
-  if ((int32_t)(now - nextBatch) >= 0) {
-    nextBatch = now + BATCH_MS;
-    fillSamples(g_buf, BATCH_SAMPLES);
-    if (uploadBatch((uint8_t *)g_buf, BATCH_SAMPLES * 2)) {
-      okCount++;
-      g_seq++;
-    } else {
-      failCount++;
+  // Drain one batch from the DMA pool. adc_digi_read_bytes sleeps this task
+  // (no busy-wait) until a batch is ready; the DMA keeps sampling during the
+  // POST below, so backlog accumulates in the pool instead of becoming a gap.
+  uint32_t got = 0;
+  esp_err_t r = adc_digi_read_bytes(rd, sizeof(rd), &got, 1000);
+  if (r == ESP_ERR_TIMEOUT && got == 0) return;  // no samples yet
+  if (r == ESP_ERR_INVALID_STATE) overflow++;    // pool overran (long stall)
+
+  for (uint32_t i = 0; i + ADC_RESULT_BYTES <= got; i += ADC_RESULT_BYTES) {
+    adc_digi_output_data_t *p = (adc_digi_output_data_t *)&rd[i];
+    if (p->type2.channel != MIC_ADC_CHANNEL) continue;  // ignore stray channels
+    g_buf[fill++] = p->type2.data;
+    if (fill >= BATCH_SAMPLES) {
+      batchStats(g_buf, BATCH_SAMPLES, &mn, &mx, &mean);
+      if (uploadBatch((uint8_t *)g_buf, BATCH_SAMPLES * 2)) { okCount++; g_seq++; }
+      else failCount++;
+      fill = 0;
     }
   }
 
+  uint32_t now = millis();
   if (now - lastReport >= 2000) {
     lastReport = now;
-    Serial.printf("[stat] seq=%lu ok=%lu fail=%lu rssi=%d heap=%lu\n",
+    Serial.printf("[stat] seq=%lu ok=%lu fail=%lu ovf=%lu rssi=%d heap=%lu | "
+                  "adc min=%u max=%u mean=%u pp=%u\n",
                   (unsigned long)g_seq, (unsigned long)okCount,
-                  (unsigned long)failCount, WiFi.RSSI(),
-                  (unsigned long)ESP.getFreeHeap());
+                  (unsigned long)failCount, (unsigned long)overflow, WiFi.RSSI(),
+                  (unsigned long)ESP.getFreeHeap(),
+                  mn, mx, mean, (unsigned)(mx - mn));
   }
 }

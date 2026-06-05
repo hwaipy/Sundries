@@ -1,2 +1,8 @@
 .pio/
 .vscode/
+
+# Python STT/analysis env and generated audio clips (large / regenerable)
+analysis/venv/
+analysis/clips/
+__pycache__/
+*.pyc
