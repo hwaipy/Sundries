@@ -12,7 +12,7 @@
 // Empty-SSID slots are skipped.
 struct WifiCred { const char *ssid; const char *pass; };
 static const WifiCred WIFI_LIST[] = {
-  {"DDX",          "18817308954"},   // #1
+  {"Africa",       "18817307870"},   // #1
   {"沙包大的沙包",  "123qweasdzxc"},   // #2
   {"2433",         "freespace"},      // #3
 };
@@ -24,22 +24,45 @@ static const WifiCred WIFI_LIST[] = {
 #define SAMPLE_RATE_HZ 10000   // samples per second (ADC rate)
 #define BATCH_MS       250     // milliseconds of data per upload
 
-// MAX9814 electret mic amplifier wiring.
-#define MIC_OUT_PIN    4       // OUT -> GPIO4 = ADC1_CH3 (WiFi-safe; ADC1 only)
+// MAX9814 electret mic amplifier wiring. The mic OUT must land on an ADC1 pin
+// (ADC2 is unusable while WiFi is on), so the pin/channel are per-chip:
+//   ESP32-S3 : GPIO4  = ADC1_CH3
+//   ESP32    : GPIO36 = ADC1_CH0  (pin "VP"/SVP; input-only; ADC1; WiFi-safe)
+#if CONFIG_IDF_TARGET_ESP32S3
+#define MIC_OUT_PIN      4
+#define MIC_ADC_CHANNEL  ADC1_CHANNEL_3
+#elif CONFIG_IDF_TARGET_ESP32
+#define MIC_OUT_PIN      36
+#define MIC_ADC_CHANNEL  ADC1_CHANNEL_0
+#else
+#error "Unsupported target: define MIC_OUT_PIN / MIC_ADC_CHANNEL for this chip"
+#endif
 #define MIC_GAIN_PIN   14      // GAIN select pin (driven digital / left hi-Z)
 #define MIC_GAIN_DB    50      // 40 = GAIN->VDD, 50 = GAIN->GND, 60 = GAIN floating
 
 // Continuous ADC (DMA) sampling. The DMA pool keeps filling at SAMPLE_RATE_HZ
 // regardless of upload state, so a slow/stalled POST no longer creates a gap.
-#define MIC_ADC_CHANNEL  ADC1_CHANNEL_3   // GPIO4 = ADC1_CH3 (keep in sync with MIC_OUT_PIN)
 #define ADC_DMA_SECONDS  1                 // hardware DMA pool depth (seconds of audio)
+
+// Classic ESP32's continuous ADC can't sample below 20kHz, so it runs at 2x and
+// averages sample pairs down to SAMPLE_RATE_HZ. S3 runs at 1x. Output stays
+// SAMPLE_RATE_HZ on both chips; the 2x oversampling also slightly improves SNR.
+#if CONFIG_IDF_TARGET_ESP32S3
+#define ADC_OVERSAMPLE   1
+#else
+#define ADC_OVERSAMPLE   2
+#endif
 
 // Producer/consumer decoupling: the ADC reader task drains the DMA pool into
 // this many app-level batch buffers; the uploader task drains those over HTTP.
 // A slow/stalled POST only grows this backlog instead of starving the ADC, so
 // sampling runs at 100% duty. Backlog tolerance = NUM_BATCH_BUFS * BATCH_MS
 // (plus the hardware DMA pool). When full, the oldest batch is dropped.
+#if CONFIG_IDF_TARGET_ESP32S3
 #define NUM_BATCH_BUFS   16                // 16 * 250ms = 4s of upload-stall slack
+#else
+#define NUM_BATCH_BUFS   8                 // classic ESP32 has less DRAM; 8 * 250ms = 2s
+#endif
 
 // Debug: when 1, skip WiFi/upload entirely and stream GPIO7 over serial as
 // "P <mean> <min> <max>" at ~100Hz for the local web plot (webgui/serial_plot.py).
@@ -197,7 +220,7 @@ static const size_t ADC_RESULT_BYTES = sizeof(adc_digi_output_data_t);
 static void adcDmaInit() {
   adc_digi_init_config_t init_cfg = {};
   init_cfg.max_store_buf_size =
-      (uint32_t)(SAMPLE_RATE_HZ * ADC_DMA_SECONDS * ADC_RESULT_BYTES);
+      (uint32_t)(SAMPLE_RATE_HZ * ADC_OVERSAMPLE * ADC_DMA_SECONDS * ADC_RESULT_BYTES);
   init_cfg.conv_num_each_intr = 1024;
   init_cfg.adc1_chan_mask = (uint16_t)BIT(MIC_ADC_CHANNEL);
   init_cfg.adc2_chan_mask = 0;
@@ -210,12 +233,21 @@ static void adcDmaInit() {
   pat.bit_width = SOC_ADC_DIGI_MAX_BITWIDTH;  // S3 digi controller = 12-bit
 
   adc_digi_configuration_t dig_cfg = {};
+#if CONFIG_IDF_TARGET_ESP32S3
   dig_cfg.conv_limit_en = false;
+#else
+  dig_cfg.conv_limit_en = true;   // classic ESP32 driver requires this set
+  dig_cfg.conv_limit_num = 250;
+#endif
   dig_cfg.pattern_num = 1;
   dig_cfg.adc_pattern = &pat;
-  dig_cfg.sample_freq_hz = SAMPLE_RATE_HZ;
+  dig_cfg.sample_freq_hz = SAMPLE_RATE_HZ * ADC_OVERSAMPLE;
   dig_cfg.conv_mode = ADC_CONV_SINGLE_UNIT_1;
-  dig_cfg.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
+#if CONFIG_IDF_TARGET_ESP32S3
+  dig_cfg.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;  // S3: 4-byte results (type2)
+#else
+  dig_cfg.format = ADC_DIGI_OUTPUT_FORMAT_TYPE1;  // classic ESP32: 2-byte (type1)
+#endif
   ESP_ERROR_CHECK(adc_digi_controller_configure(&dig_cfg));
   ESP_ERROR_CHECK(adc_digi_start());
 }
@@ -247,8 +279,19 @@ static void adcReaderTask(void *) {
 
     for (uint32_t i = 0; i + ADC_RESULT_BYTES <= got; i += ADC_RESULT_BYTES) {
       adc_digi_output_data_t *p = (adc_digi_output_data_t *)&rd[i];
-      if (p->type2.channel != MIC_ADC_CHANNEL) continue;  // ignore stray channels
-      cur[fill++] = p->type2.data;
+#if CONFIG_IDF_TARGET_ESP32S3
+      uint32_t ch = p->type2.channel, val = p->type2.data;
+#else
+      uint32_t ch = p->type1.channel, val = p->type1.data;
+#endif
+      if (ch != MIC_ADC_CHANNEL) continue;  // ignore stray channels
+#if ADC_OVERSAMPLE > 1
+      static uint32_t osAcc = 0; static uint8_t osN = 0;  // average OVERSAMPLE -> 1
+      osAcc += val;
+      if (++osN < ADC_OVERSAMPLE) continue;
+      val = osAcc / ADC_OVERSAMPLE; osAcc = 0; osN = 0;
+#endif
+      cur[fill++] = val;
       if (fill >= BATCH_SAMPLES) {
         xQueueSend(g_readyQ, &cur, 0);  // length == pool size -> never blocks
         cur = nullptr;
@@ -308,15 +351,18 @@ void setup() {
   }
 #endif
 
+#if CONFIG_IDF_TARGET_ESP32S3
   // Kill the onboard RGB LED (WS2812). Board clones wire it to various GPIOs, so
   // black out every plausible data pin. System pins (flash 26-32, PSRAM 33-37,
   // native-USB 19/20, UART0 43/44) and our mic 4 / gain 14 are deliberately
   // excluded. The red power LED is hardwired to 3V3 and not software-controllable.
+  // (ESP32-S3 only; on classic ESP32 these pins include UART0 TX.)
   static const uint8_t rgbPins[] = {
     48, 47, 46, 45, 42, 41, 40, 39, 38, 21,
     18, 17, 16, 15, 13, 12, 11, 10, 9, 8, 7, 6, 5, 2, 1};
   for (uint8_t i = 0; i < sizeof(rgbPins) / sizeof(rgbPins[0]); i++)
     neopixelWrite(rgbPins[i], 0, 0, 0);
+#endif
 
   setMicGain();
 
