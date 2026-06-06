@@ -1,0 +1,27 @@
+# Recorder ingest + viewer + per-minute MP3.
+#
+#   cd server
+#   docker compose up -d --build
+#
+# Recordings (<board>/<UTC-day>.bin, meta.json) and the per-minute MP3 snapshots
+# (<board>/mp3/<day>_<index>.mp3) land in the host directory bind-mounted at
+# /data below. Override the host path without editing this file:
+#
+#   RECORDER_DATA=/srv/recorder docker compose up -d --build
+services:
+  recorder-server:
+    build: .
+    image: recorder-server
+    container_name: recorder-server
+    restart: unless-stopped
+    ports:
+      - "8123:8123"   # ingest: boards POST /ingest/<board> (or frpc forwards here)
+      - "8124:8124"   # web GUI / viewer dashboard
+    volumes:
+      # Host directory bind-mounted in. Default: ./data next to this file.
+      - ${RECORDER_DATA:-./data}:/data
+    # Optional MP3 tuning (defaults: 60s/file, 64kbps mono). Uncomment to change.
+    # environment:
+    #   INGEST_MP3_SECONDS: "60"
+    #   INGEST_MP3_BITRATE: "64"
+    #   INGEST_NO_MP3: "0"      # set to 1 to turn the MP3 snapshots off

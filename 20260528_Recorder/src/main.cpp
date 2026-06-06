@@ -19,19 +19,19 @@ static const WifiCred WIFI_LIST[] = {
 #define WIFI_CONN_TIMEOUT_MS 10000    // per-network connect timeout
 
 #define SERVER_HOST    "grayfog.chat"
-#define SERVER_PORT    9123
+#define SERVER_PORT    8123
 
 #define SAMPLE_RATE_HZ 10000   // samples per second (ADC rate)
 #define BATCH_MS       250     // milliseconds of data per upload
 
 // MAX9814 electret mic amplifier wiring.
-#define MIC_OUT_PIN    7       // OUT -> GPIO7 = ADC1_CH6 (WiFi-safe; ADC1 only)
+#define MIC_OUT_PIN    4       // OUT -> GPIO4 = ADC1_CH3 (WiFi-safe; ADC1 only)
 #define MIC_GAIN_PIN   14      // GAIN select pin (driven digital / left hi-Z)
 #define MIC_GAIN_DB    50      // 40 = GAIN->VDD, 50 = GAIN->GND, 60 = GAIN floating
 
 // Continuous ADC (DMA) sampling. The DMA pool keeps filling at SAMPLE_RATE_HZ
 // regardless of upload state, so a slow/stalled POST no longer creates a gap.
-#define MIC_ADC_CHANNEL  ADC1_CHANNEL_6   // GPIO7 = ADC1_CH6 (keep in sync with MIC_OUT_PIN)
+#define MIC_ADC_CHANNEL  ADC1_CHANNEL_3   // GPIO4 = ADC1_CH3 (keep in sync with MIC_OUT_PIN)
 #define ADC_DMA_SECONDS  1                 // hardware DMA pool depth (seconds of audio)
 
 // Producer/consumer decoupling: the ADC reader task drains the DMA pool into
@@ -45,6 +45,11 @@ static const WifiCred WIFI_LIST[] = {
 // "P <mean> <min> <max>" at ~100Hz for the local web plot (webgui/serial_plot.py).
 // Set back to 0 and reflash to resume the recorder/upload behavior.
 #define DEBUG_PLOT     0
+
+// LED_SCAN: diagnostic mode to find the onboard RGB data pin. When 1, setup()
+// lights each candidate GPIO white for 2s in order and loops forever; whichever
+// step turns the LED white identifies the pin. Set back to 0 after locating it.
+#define LED_SCAN       0
 // ===================================================
 
 // Samples per batch and bytes (uint16 little-endian per sample).
@@ -283,6 +288,36 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println();
+
+#if LED_SCAN
+  // Sweep candidate RGB data pins: white 2s each, in this order, 0.6s gap.
+  static const uint8_t scanPins[] = {
+    1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 21,
+    33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 45, 46, 47, 48};
+  Serial.println("[ledscan] start");
+  for (;;) {
+    for (uint8_t i = 0; i < sizeof(scanPins) / sizeof(scanPins[0]); i++) {
+      Serial.printf("[ledscan] #%u GPIO%u\n", (unsigned)(i + 1), scanPins[i]);
+      neopixelWrite(scanPins[i], 90, 90, 90);
+      delay(2000);
+      neopixelWrite(scanPins[i], 0, 0, 0);
+      delay(600);
+    }
+    Serial.println("[ledscan] --- sweep restart ---");
+    delay(1500);
+  }
+#endif
+
+  // Kill the onboard RGB LED (WS2812). Board clones wire it to various GPIOs, so
+  // black out every plausible data pin. System pins (flash 26-32, PSRAM 33-37,
+  // native-USB 19/20, UART0 43/44) and our mic 4 / gain 14 are deliberately
+  // excluded. The red power LED is hardwired to 3V3 and not software-controllable.
+  static const uint8_t rgbPins[] = {
+    48, 47, 46, 45, 42, 41, 40, 39, 38, 21,
+    18, 17, 16, 15, 13, 12, 11, 10, 9, 8, 7, 6, 5, 2, 1};
+  for (uint8_t i = 0; i < sizeof(rgbPins) / sizeof(rgbPins[0]); i++)
+    neopixelWrite(rgbPins[i], 0, 0, 0);
+
   setMicGain();
 
   g_boardId = deriveBoardId();

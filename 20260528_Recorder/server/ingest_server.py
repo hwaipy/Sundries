@@ -15,11 +15,16 @@ Stdlib only. Run:
   python3 ingest_server.py [--host 0.0.0.0] [--port 8123] [--web-port 8124] [--data ./data]
 """
 import argparse
+import array
 import json
 import os
 import re
+import shutil
 import struct
+import subprocess
+import sys
 import threading
+import time
 import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +32,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 BOARD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 DATE_BIN_RE = re.compile(r"^\d{8}\.bin$")
 MAX_BODY = 8 * 1024 * 1024  # 8 MiB per batch, generous upper bound
+
+# Per-minute MP3 snapshots: a background thread slices each board's raw .bin
+# into fixed-length windows, DC-removes + scales them to 16-bit PCM, and pipes
+# them through `lame` into DATA_DIR/<board>/mp3/<day>_<index>.mp3. Slicing is by
+# sample count (gapless, exactly MP3_SECONDS each) with a cursor persisted in
+# meta.json, so restarts resume instead of re-encoding.
+MP3_ENABLE = True
+MP3_SECONDS = 60      # audio seconds per file
+MP3_BITRATE = 64      # kbps, mono
+MP3_GAIN = 16         # 12-bit ADC span -> 16-bit PCM span
 
 DATA_DIR = "./data"
 _locks_guard = threading.Lock()
@@ -129,6 +144,135 @@ def read_recent(board_id: str, secs: float, buckets: int = 800) -> dict:
         bk.append([min(chunk), max(chunk)])
     out["buckets"] = bk
     return out
+
+
+# ----------------------------- per-minute MP3 snapshots -----------------------------
+
+def list_bins(board_id: str):
+    bdir = board_dir(board_id)
+    if not os.path.isdir(bdir):
+        return bdir, []
+    return bdir, sorted(n for n in os.listdir(bdir) if DATE_BIN_RE.match(n))
+
+
+def adc_slice_to_pcm(raw: bytes) -> bytes:
+    """Raw little-endian uint16 ADC samples -> signed 16-bit mono PCM, with the
+    per-slice DC bias removed and the 12-bit span scaled toward 16-bit."""
+    a = array.array("H")
+    a.frombytes(raw[: (len(raw) // 2) * 2])
+    if sys.byteorder == "big":
+        a.byteswap()
+    n = len(a)
+    if n == 0:
+        return b""
+    mean = sum(a) // n
+    out = array.array("h", bytes(2 * n))
+    for i in range(n):
+        v = (a[i] - mean) * MP3_GAIN
+        if v > 32767:
+            v = 32767
+        elif v < -32768:
+            v = -32768
+        out[i] = v
+    if sys.byteorder == "big":
+        out.byteswap()
+    return out.tobytes()
+
+
+def encode_mp3(pcm: bytes, rate: int, out_path: str) -> bool:
+    """Pipe raw PCM through lame. lame auto-resamples non-MPEG rates (e.g. the
+    10kHz capture -> 11.025kHz) so playback speed/pitch stay correct."""
+    tmp = out_path + ".tmp"
+    cmd = ["lame", "-r", "-s", f"{rate / 1000:g}",
+           "--signed", "--bitwidth", "16", "--little-endian",
+           "-m", "m", "-b", str(MP3_BITRATE), "--quiet", "-", tmp]
+    try:
+        p = subprocess.run(cmd, input=pcm,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        return False
+    if p.returncode != 0:
+        print(f"[mp3] lame rc={p.returncode}: "
+              f"{p.stderr.decode(errors='replace').strip()}", flush=True)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    os.replace(tmp, out_path)
+    return True
+
+
+def mp3_step(board_id: str) -> bool:
+    """Encode at most one pending MP3 window for the board, advancing a cursor in
+    meta.json. Returns True if it did work (encoded, or skipped to a newer .bin),
+    False once caught up. The heavy lame call runs outside the per-board lock."""
+    meta_path = os.path.join(board_dir(board_id), "meta.json")
+    with board_lock(board_id):
+        meta = load_meta(meta_path)
+        rate = meta.get("sample_rate_hz") or 10000
+        if not isinstance(rate, int) or rate <= 0:
+            rate = 10000
+        slice_bytes = rate * MP3_SECONDS * 2
+        bdir, bins = list_bins(board_id)
+        if not bins:
+            return False
+        cur = meta.get("mp3_bin")
+        off = meta.get("mp3_offset", 0)
+        if cur not in bins:           # unset or pointing at a rotated-away file
+            cur, off = bins[-1], 0
+        path = os.path.join(bdir, cur)
+        size = os.path.getsize(path)
+        if size - off < slice_bytes:  # not a full window yet in the cursor's .bin
+            newer = [b for b in bins if b > cur]
+            if newer:                 # day rolled over: skip the <1min tail, advance
+                meta["mp3_bin"], meta["mp3_offset"] = newer[0], 0
+                save_meta(meta_path, meta)
+                return True
+            if meta.get("mp3_bin") != cur or meta.get("mp3_offset") != off:
+                meta["mp3_bin"], meta["mp3_offset"] = cur, off
+                save_meta(meta_path, meta)
+            return False
+        index = off // slice_bytes
+        enc_bin, enc_off = cur, off
+
+    with open(path, "rb") as f:       # append-only region below `size`: safe unlocked
+        f.seek(enc_off)
+        raw = f.read(slice_bytes)
+    pcm = adc_slice_to_pcm(raw)
+    mp3_dir = os.path.join(bdir, "mp3")
+    os.makedirs(mp3_dir, exist_ok=True)
+    out_path = os.path.join(mp3_dir, f"{enc_bin[:-4]}_{index:04d}.mp3")
+    if not encode_mp3(pcm, rate, out_path):
+        return False                  # leave the cursor put; retry next tick
+
+    with board_lock(board_id):
+        meta = load_meta(meta_path)   # reload to keep concurrent ingest updates
+        meta["mp3_bin"] = enc_bin
+        meta["mp3_offset"] = enc_off + slice_bytes
+        meta["mp3_last"] = os.path.basename(out_path)
+        meta["mp3_count"] = meta.get("mp3_count", 0) + 1
+        save_meta(meta_path, meta)
+    print(f"[mp3] {board_id} -> {os.path.basename(out_path)} "
+          f"({len(pcm) // 2} samples)", flush=True)
+    return True
+
+
+def mp3_worker(interval: float = 5.0) -> None:
+    """Drain every board's pending MP3 windows, then sleep. Also backfills any
+    accumulated unencoded audio (e.g. after the server was down)."""
+    while True:
+        try:
+            boards = ([n for n in os.listdir(DATA_DIR)
+                       if os.path.isfile(os.path.join(DATA_DIR, n, "meta.json"))]
+                      if os.path.isdir(DATA_DIR) else [])
+            for b in boards:
+                guard = 0
+                while mp3_step(b) and guard < 100000:
+                    guard += 1
+        except Exception as e:  # never let the worker thread die
+            print(f"[mp3] worker error: {e}", flush=True)
+        time.sleep(interval)
 
 
 # ----------------------------- ingest server (POST) -----------------------------
@@ -359,7 +503,7 @@ setInterval(async()=>{ await refreshBoards(); await pull(); }, REFRESH_MS);
 
 
 def main():
-    global DATA_DIR
+    global DATA_DIR, MP3_ENABLE, MP3_SECONDS, MP3_BITRATE
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default=os.environ.get("INGEST_HOST", "0.0.0.0"),
                     help="bind address (0.0.0.0 so the frpc container can reach it)")
@@ -367,9 +511,30 @@ def main():
     ap.add_argument("--web-port", type=int, default=int(os.environ.get("INGEST_WEB_PORT", 8124)),
                     help="viewer/dashboard port (0 to disable)")
     ap.add_argument("--data", default=os.environ.get("INGEST_DATA", "./data"))
+    ap.add_argument("--no-mp3", action="store_true",
+                    default=os.environ.get("INGEST_NO_MP3", "") not in ("", "0", "false"),
+                    help="disable the per-minute MP3 snapshots")
+    ap.add_argument("--mp3-seconds", type=int,
+                    default=int(os.environ.get("INGEST_MP3_SECONDS", MP3_SECONDS)),
+                    help="audio seconds per MP3 file")
+    ap.add_argument("--mp3-bitrate", type=int,
+                    default=int(os.environ.get("INGEST_MP3_BITRATE", MP3_BITRATE)),
+                    help="MP3 bitrate in kbps (mono)")
     args = ap.parse_args()
     DATA_DIR = os.path.abspath(args.data)
     os.makedirs(DATA_DIR, exist_ok=True)
+    MP3_ENABLE = not args.no_mp3
+    MP3_SECONDS = max(1, args.mp3_seconds)
+    MP3_BITRATE = args.mp3_bitrate
+
+    if MP3_ENABLE:
+        if shutil.which("lame"):
+            threading.Thread(target=mp3_worker, daemon=True).start()
+            print(f"[mp3] enabled: {MP3_SECONDS}s/file @ {MP3_BITRATE}kbps "
+                  f"-> <board>/mp3/", flush=True)
+        else:
+            print("[mp3] DISABLED: 'lame' not found on PATH (apt-get install lame)",
+                  flush=True)
 
     if args.web_port:
         web = ThreadingHTTPServer((args.host, args.web_port), WebHandler)
