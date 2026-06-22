@@ -1,0 +1,14 @@
+# 降噪 (denoise.py)
+numpy
+scipy
+
+# 转写 (transcribe.py) — 仅 Apple Silicon
+mlx-whisper
+
+# 说话人区分 (diarize.py)
+resemblyzer
+scikit-learn
+opencc-python-reimplemented
+
+# 系统依赖 (非 pip): ffmpeg / ffprobe
+#   macOS:  brew install ffmpeg

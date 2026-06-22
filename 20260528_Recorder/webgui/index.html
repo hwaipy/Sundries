@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Recorder</title>
+<style>
+:root {
+  --bg: #1a1a2e;
+  --bg2: #16213e;
+  --bg3: #0f3460;
+  --fg: #e0e0e0;
+  --fg2: #a0a0b0;
+  --accent: #e94560;
+  --accent2: #0f3460;
+  --green: #4ecca3;
+  --radius: 8px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── header ── */
+header {
+  display: flex;
+  align-items: center;
+  padding: 12px 20px;
+  background: var(--bg2);
+  border-bottom: 1px solid #333;
+  gap: 16px;
+  flex-shrink: 0;
+}
+header h1 { font-size: 18px; font-weight: 600; }
+#status {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--fg2);
+}
+.status-dot {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+.status-dot.on { background: var(--green); }
+.status-dot.off { background: #666; }
+
+/* ── layout ── */
+.container {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* ── sidebar ── */
+.sidebar {
+  width: 220px;
+  background: var(--bg2);
+  border-right: 1px solid #333;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+.device-item {
+  padding: 12px 16px;
+  cursor: pointer;
+  border-bottom: 1px solid #2a2a3e;
+  transition: background 0.15s;
+  font-size: 13px;
+}
+.device-item:hover { background: var(--bg3); }
+.device-item.active { background: var(--accent); color: #fff; }
+.device-item .count {
+  float: right;
+  font-size: 11px;
+  color: var(--fg2);
+  background: rgba(255,255,255,0.1);
+  padding: 1px 8px;
+  border-radius: 10px;
+}
+.device-item.active .count { color: #fff; background: rgba(255,255,255,0.25); }
+
+/* ── main ── */
+.main {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+}
+.main::-webkit-scrollbar { width: 6px; }
+.main::-webkit-scrollbar-thumb { background: #444; border-radius: 3px; }
+
+.empty-msg {
+  text-align: center;
+  color: var(--fg2);
+  margin-top: 80px;
+  font-size: 14px;
+}
+
+/* ── recording item ── */
+.rec-item {
+  background: var(--bg2);
+  border-radius: var(--radius);
+  margin-bottom: 8px;
+  overflow: hidden;
+}
+.rec-header {
+  display: flex;
+  align-items: center;
+  padding: 10px 14px;
+  gap: 10px;
+  cursor: pointer;
+}
+.rec-header:hover { background: rgba(255,255,255,0.03); }
+
+.play-btn {
+  width: 32px; height: 32px;
+  border-radius: 50%;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: transform 0.1s;
+}
+.play-btn:hover { transform: scale(1.1); }
+.play-btn:active { transform: scale(0.95); }
+
+.raw-btn {
+  width: 24px; height: 24px;
+  border-radius: 50%;
+  border: 1px solid var(--fg2);
+  background: transparent;
+  color: var(--fg2);
+  font-size: 9px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+.raw-btn:hover { border-color: #8b6914; color: #8b6914; }
+.raw-btn.playing { border-color: #8b6914; color: #8b6914; background: rgba(139,105,20,0.15); }
+
+.rec-info {
+  flex: 1;
+  min-width: 0;
+}
+.rec-time {
+  font-size: 13px;
+  font-weight: 500;
+}
+.rec-meta {
+  font-size: 11px;
+  color: var(--fg2);
+  margin-top: 2px;
+}
+
+/* progress bar */
+.progress-wrap {
+  width: 180px;
+  height: 4px;
+  background: rgba(255,255,255,0.1);
+  border-radius: 2px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.progress-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  width: 0%;
+  transition: width 0.1s linear;
+}
+.progress-time {
+  font-size: 11px;
+  color: var(--fg2);
+  width: 40px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+/* ── transcript ── */
+.transcript {
+  padding: 0 14px 10px 56px;
+}
+.seg-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 3px 0;
+  border-radius: 4px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.seg-line:hover { background: rgba(255,255,255,0.03); }
+.seg-play {
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  border: 1px solid var(--fg2);
+  background: transparent;
+  color: var(--fg2);
+  font-size: 9px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 2px;
+  transition: all 0.15s;
+}
+.seg-play:hover { border-color: var(--accent); color: var(--accent); }
+.seg-play.playing { border-color: var(--accent); color: var(--accent); background: rgba(233,69,96,0.1); }
+.seg-time {
+  font-size: 11px;
+  color: var(--fg2);
+  width: 45px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.seg-text {
+  flex: 1;
+  color: var(--fg);
+}
+
+/* ── loading ── */
+.loading {
+  text-align: center;
+  padding: 20px;
+  color: var(--fg2);
+  font-size: 13px;
+}
+.spinner {
+  display: inline-block;
+  width: 16px; height: 16px;
+  border: 2px solid var(--fg2);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── transcript badge ── */
+.badge-tr {
+  font-size: 10px;
+  background: var(--green);
+  color: #000;
+  padding: 1px 6px;
+  border-radius: 8px;
+  margin-left: 4px;
+}
+.badge-pending {
+  font-size: 10px;
+  background: #555;
+  color: #ccc;
+  padding: 1px 6px;
+  border-radius: 8px;
+  margin-left: 4px;
+}
+.badge-denoised {
+  font-size: 10px;
+  background: #5b86e5;
+  color: #fff;
+  padding: 1px 6px;
+  border-radius: 8px;
+  margin-left: 4px;
+}
+.badge-raw {
+  font-size: 10px;
+  background: #8b6914;
+  color: #fff;
+  padding: 1px 6px;
+  border-radius: 8px;
+  margin-left: 4px;
+}
+.toggle-btn {
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--fg2);
+  background: transparent;
+  color: var(--fg2);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.toggle-btn.active {
+  border-color: var(--green);
+  color: var(--green);
+  background: rgba(78,204,163,0.1);
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Recorder</h1>
+  <button class="toggle-btn active" id="hideEmpty" onclick="toggleHideEmpty()">Hide empty</button>
+  <button class="toggle-btn active" id="textSrc" onclick="toggleTextSrc()">Raw text</button>
+  <div id="status"></div>
+</header>
+
+<div class="container">
+  <div class="sidebar" id="sidebar"></div>
+  <div class="main" id="main">
+    <div class="empty-msg">Select a device</div>
+  </div>
+</div>
+
+<script>
+// ── state ──
+let devices = [];
+let activeDevice = null;
+let recordings = [];
+let recTotal = 0;
+let loading = false;
+let hideEmpty = true;
+let useRawText = true;
+const PAGE_SIZE = 100;
+
+// ── global audio ──
+let globalAudio = null;
+let activePlayBtn = null;
+let activeProgressInterval = null;
+let activeSegBtn = null;
+let segStopTimeout = null;
+
+function stopAll() {
+  if (globalAudio) {
+    globalAudio.pause();
+    globalAudio.currentTime = 0;
+  }
+  if (activePlayBtn) {
+    if (activePlayBtn.classList.contains("raw-btn")) {
+      activePlayBtn.textContent = "R";
+      activePlayBtn.classList.remove("playing");
+    } else {
+      activePlayBtn.textContent = "\u25B6";
+    }
+  }
+  if (activeProgressInterval) {
+    clearInterval(activeProgressInterval);
+    activeProgressInterval = null;
+  }
+  if (activeSegBtn) {
+    activeSegBtn.classList.remove("playing");
+    activeSegBtn.textContent = "\u25B6";
+  }
+  if (segStopTimeout) {
+    clearTimeout(segStopTimeout);
+    segStopTimeout = null;
+  }
+  // reset all progress bars
+  document.querySelectorAll(".progress-bar").forEach(b => b.style.width = "0%");
+  document.querySelectorAll(".progress-time").forEach(t => t.textContent = "");
+  activePlayBtn = null;
+  activeSegBtn = null;
+}
+
+// ── fetch helpers ──
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  return r.json();
+}
+
+// ── status polling ──
+async function pollStatus() {
+  try {
+    const s = await fetchJSON("/api/status");
+    const el = document.getElementById("status");
+    const webdav = s.webdav_mounted;
+    const tr = s.transcribe;
+    const dn = s.denoise;
+    let html = `<span class="status-dot ${webdav ? 'on' : 'off'}"></span>WebDAV `;
+    if (dn && dn.current) {
+      html += `| <span class="spinner"></span>Denoise: ${dn.current} (${dn.queue}) `;
+    }
+    if (tr.current) {
+      html += `| <span class="spinner"></span>STT: ${tr.current} (${tr.queue})`;
+    } else {
+      html += "| STT idle";
+    }
+    el.innerHTML = html;
+  } catch(e) {}
+}
+setInterval(pollStatus, 5000);
+pollStatus();
+
+// ── devices ──
+async function loadDevices() {
+  devices = await fetchJSON("/api/devices");
+  renderSidebar();
+}
+
+function renderSidebar() {
+  const el = document.getElementById("sidebar");
+  el.innerHTML = devices.map(d => `
+    <div class="device-item ${d.id === activeDevice ? 'active' : ''}"
+         onclick="selectDevice('${d.id}')">
+      ${d.id.replace('esp32-', '')}
+      <span class="count">${d.count}</span>
+    </div>
+  `).join("");
+}
+
+function selectDevice(id) {
+  stopAll();
+  activeDevice = id;
+  recordings = [];
+  recTotal = 0;
+  renderSidebar();
+  loadRecordings(true);
+}
+
+// ── recordings ──
+async function loadRecordings(reset) {
+  if (loading) return;
+  loading = true;
+
+  const offset = reset ? 0 : recordings.length;
+  if (reset) {
+    document.getElementById("main").innerHTML = '<div class="loading"><span class="spinner"></span>Loading...</div>';
+  }
+
+  const data = await fetchJSON(`/api/recordings/${activeDevice}?offset=${offset}&limit=${PAGE_SIZE}`);
+  if (reset) {
+    recordings = data.items;
+  } else {
+    recordings = recordings.concat(data.items);
+  }
+  recTotal = data.total;
+  loading = false;
+  renderRecordings();
+}
+
+function formatTime(mtime) {
+  const d = new Date(mtime * 1000);
+  const pad = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function formatDuration(sec) {
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function formatSize(bytes) {
+  return (bytes / 1024).toFixed(0) + " KB";
+}
+
+function renderRecordings() {
+  const el = document.getElementById("main");
+  let html = "";
+  recordings.forEach((rec, idx) => {
+    // Choose transcript source based on toggle
+    const curTranscript = useRawText ? rec.transcript_raw : rec.transcript;
+    const validSegs = curTranscript ? curTranscript.filter(seg => !isNoiseSeg(seg.text)) : [];
+    const hasText = validSegs.length > 0;
+    // Always filter by raw text availability
+    const rawSegs = rec.transcript_raw ? rec.transcript_raw.filter(seg => !isNoiseSeg(seg.text)) : [];
+    if (hideEmpty && rawSegs.length === 0) return;
+
+    const time = formatTime(rec.mtime);
+    const audioBadge = rec.is_denoised
+      ? '<span class="badge-denoised">denoised</span>'
+      : '<span class="badge-raw">raw</span>';
+    const hasTr = curTranscript && curTranscript.length > 0;
+    const trBadge = hasTr
+      ? '<span class="badge-tr">text</span>'
+      : '<span class="badge-pending">...</span>';
+
+    html += `<div class="rec-item" id="rec-${idx}">
+      <div class="rec-header">
+        <button class="play-btn" id="pbtn-${idx}" onclick="playRec(${idx}, false, event)">\u25B6</button>
+        <button class="raw-btn" id="rbtn-${idx}" onclick="playRec(${idx}, true, event)" title="Play raw">R</button>
+        <div class="rec-info">
+          <div class="rec-time">${time} ${audioBadge} ${trBadge}</div>
+          <div class="rec-meta">${rec.filename} &middot; ${formatSize(rec.size)}</div>
+        </div>
+        <div class="progress-wrap" id="pwrap-${idx}" onclick="seekRec(${idx}, event)">
+          <div class="progress-bar" id="pbar-${idx}"></div>
+        </div>
+        <div class="progress-time" id="ptime-${idx}"></div>
+      </div>`;
+
+    if (validSegs.length > 0) {
+      html += '<div class="transcript">';
+      validSegs.forEach((seg) => {
+        const si = rec.transcript.indexOf(seg);
+        const st = formatDuration(seg.start);
+        html += `<div class="seg-line">
+          <button class="seg-play" id="sbtn-${idx}-${si}"
+                  onclick="playSegment(${idx}, ${si}, event)">\u25B6</button>
+          <span class="seg-time">${st}</span>
+          <span class="seg-text">${escHtml(seg.text)}</span>
+        </div>`;
+      });
+      html += '</div>';
+    }
+    html += '</div>';
+  });
+
+  if (recordings.length < recTotal) {
+    html += '<div class="loading" id="load-more">Scroll for more...</div>';
+  }
+  el.innerHTML = html;
+
+  // Auto-load more if page isn't full (e.g. hide empty filtered most items)
+  requestAnimationFrame(() => {
+    const mainEl = document.getElementById("main");
+    if (mainEl.scrollHeight <= mainEl.clientHeight && recordings.length < recTotal && !loading) {
+      loadRecordings(false);
+    }
+  });
+}
+
+function escHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function toggleHideEmpty() {
+  hideEmpty = !hideEmpty;
+  const btn = document.getElementById("hideEmpty");
+  btn.classList.toggle("active", hideEmpty);
+  renderRecordings();
+}
+
+function toggleTextSrc() {
+  useRawText = !useRawText;
+  const btn = document.getElementById("textSrc");
+  btn.classList.toggle("active", useRawText);
+  btn.textContent = useRawText ? "Raw text" : "Denoised text";
+  // Reload data to get fresh page with correct text source
+  loadRecordings(true);
+}
+
+// ── noise filter ──
+const HALLUC_KEYWORDS = [
+  "点赞", "订阅", "明镜", "字幕志愿者", "独播剧场", "请使用简体中文",
+  "谢谢观看", "感谢观看", "有尿尾", "字幕提供", "未经许可", "不得翻唱",
+  "字幕 by", "中文字幕", "李宗盛", "简体中文", "对话录音转写",
+  "情组", "jakiś", "打到你", "F于na", "谐团", "Bird",
+  "鞭提香", "詞曲", "词曲", "bwd6", "A-FDA"
+];
+function isNoiseSeg(text) {
+  const t = text.replace(/\s/g, "");
+  if (t.length <= 2) return true;
+  if (/^\d+$/.test(t)) return true;
+  if (/^[A-Za-z\-\d]+$/.test(t)) return true;
+  for (const kw of HALLUC_KEYWORDS) {
+    if (text.includes(kw)) return true;
+  }
+  // Repetitive pattern: same 1-3 char chunk repeated >= 4 times
+  if (/(.{1,3})\1{3,}/.test(t)) return true;
+  return false;
+}
+
+// ── infinite scroll ──
+document.getElementById("main").addEventListener("scroll", function() {
+  const el = this;
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 100) {
+    if (!loading && recordings.length < recTotal) {
+      loadRecordings(false);
+    }
+  }
+});
+
+// ── play full recording ──
+function playRec(idx, raw, event) {
+  event.stopPropagation();
+  const rec = recordings[idx];
+  const btn = raw ? document.getElementById(`rbtn-${idx}`) : document.getElementById(`pbtn-${idx}`);
+
+  // If same button is playing, toggle pause
+  if (activePlayBtn === btn && globalAudio && !globalAudio.paused) {
+    globalAudio.pause();
+    btn.textContent = raw ? "R" : "\u25B6";
+    return;
+  }
+  if (activePlayBtn === btn && globalAudio && globalAudio.paused && globalAudio.currentTime > 0) {
+    globalAudio.play();
+    btn.textContent = raw ? "\u25A0" : "\u23F8";
+    startProgress(idx);
+    return;
+  }
+
+  stopAll();
+
+  const url = raw ? `/audio-raw/${activeDevice}/${rec.filename}` : `/audio/${activeDevice}/${rec.filename}`;
+  globalAudio = new Audio(url);
+  activePlayBtn = btn;
+  if (raw) {
+    btn.classList.add("playing");
+    btn.textContent = "\u25A0";
+  } else {
+    btn.textContent = "\u23F8";
+  }
+
+  globalAudio.addEventListener("ended", () => {
+    stopAll();
+  });
+
+  globalAudio.play();
+  startProgress(idx);
+}
+
+function startProgress(idx) {
+  if (activeProgressInterval) clearInterval(activeProgressInterval);
+  const pbar = document.getElementById(`pbar-${idx}`);
+  const ptime = document.getElementById(`ptime-${idx}`);
+  activeProgressInterval = setInterval(() => {
+    if (!globalAudio || !globalAudio.duration) return;
+    const pct = (globalAudio.currentTime / globalAudio.duration) * 100;
+    pbar.style.width = pct + "%";
+    ptime.textContent = formatDuration(globalAudio.currentTime);
+  }, 100);
+}
+
+function seekRec(idx, event) {
+  event.stopPropagation();
+  if (!globalAudio || !globalAudio.duration) return;
+  const wrap = document.getElementById(`pwrap-${idx}`);
+  const rect = wrap.getBoundingClientRect();
+  const pct = (event.clientX - rect.left) / rect.width;
+  globalAudio.currentTime = pct * globalAudio.duration;
+}
+
+// ── play segment ──
+function playSegment(idx, segIdx, event) {
+  event.stopPropagation();
+  const rec = recordings[idx];
+  const seg = rec.transcript[segIdx];
+  const btn = document.getElementById(`sbtn-${idx}-${segIdx}`);
+
+  // If same segment is playing, stop it
+  if (activeSegBtn === btn && globalAudio && !globalAudio.paused) {
+    stopAll();
+    return;
+  }
+
+  stopAll();
+
+  const url = `/audio/${activeDevice}/${rec.filename}`;
+  globalAudio = new Audio(url);
+  activeSegBtn = btn;
+  btn.classList.add("playing");
+  btn.textContent = "\u25A0";
+
+  globalAudio.addEventListener("canplay", function onCanPlay() {
+    globalAudio.removeEventListener("canplay", onCanPlay);
+    globalAudio.currentTime = seg.start;
+    globalAudio.play();
+
+    // Stop at segment end
+    const duration = (seg.end - seg.start) * 1000 + 200;
+    segStopTimeout = setTimeout(() => {
+      stopAll();
+    }, duration);
+  });
+
+  // Also monitor timeupdate for more precise stop
+  globalAudio.addEventListener("timeupdate", function onTime() {
+    if (globalAudio.currentTime >= seg.end) {
+      globalAudio.removeEventListener("timeupdate", onTime);
+      stopAll();
+    }
+  });
+
+  globalAudio.addEventListener("ended", () => stopAll());
+}
+
+// auto-refresh removed
+
+// ── init ──
+loadDevices();
+</script>
+</body>
+</html>

@@ -38,7 +38,7 @@ static const WifiCred WIFI_LIST[] = {
 #error "Unsupported target: define MIC_OUT_PIN / MIC_ADC_CHANNEL for this chip"
 #endif
 #define MIC_GAIN_PIN   14      // GAIN select pin (driven digital / left hi-Z)
-#define MIC_GAIN_DB    50      // 40 = GAIN->VDD, 50 = GAIN->GND, 60 = GAIN floating
+#define MIC_GAIN_DB    40      // 40 = GAIN->VDD, 50 = GAIN->GND, 60 = GAIN floating
 
 // Continuous ADC (DMA) sampling. The DMA pool keeps filling at SAMPLE_RATE_HZ
 // regardless of upload state, so a slow/stalled POST no longer creates a gap.
@@ -119,6 +119,59 @@ static void setMicGain() {
 #else  // 60dB: leave the pin floating (high-impedance input).
   pinMode(MIC_GAIN_PIN, INPUT);
 #endif
+}
+
+// ── Digital notch filters: remove 50Hz mains hum + harmonics ──────────
+// Biquad IIR notch filter: H(z) = (1 - 2cos(w0)z^-1 + z^-2) /
+//                                  (1 - 2r·cos(w0)z^-1 + r²·z^-2)
+// where w0 = 2π·f0/fs, r = 1 - π·BW/fs, BW = f0/Q.
+#define NOTCH_Q         10          // quality factor (narrowness of notch)
+#define NOTCH_HARMONICS 20          // 50Hz × 1..20 = up to 1000Hz
+
+struct Biquad {
+  float b0, b1, b2, a1, a2;  // a0 is always 1 (normalized)
+  float x1, x2, y1, y2;      // delay line
+};
+
+static Biquad g_notch[NOTCH_HARMONICS];
+static int    g_nNotch = 0;
+
+static void initNotchFilters() {
+  g_nNotch = 0;
+  for (int k = 1; k <= NOTCH_HARMONICS; k++) {
+    float f0 = 50.0f * k;
+    if (f0 >= SAMPLE_RATE_HZ / 2) break;   // skip above Nyquist
+    float w0 = 2.0f * M_PI * f0 / SAMPLE_RATE_HZ;
+    float bw = f0 / NOTCH_Q;
+    float r  = 1.0f - M_PI * bw / SAMPLE_RATE_HZ;
+    float cosw = cosf(w0);
+    Biquad &nf = g_notch[g_nNotch];
+    // Numerator (zeros on unit circle at w0)
+    nf.b0 = 1.0f;
+    nf.b1 = -2.0f * cosw;
+    nf.b2 = 1.0f;
+    // Denominator (poles just inside unit circle)
+    nf.a1 = -2.0f * r * cosw;
+    nf.a2 = r * r;
+    // Normalize so passband gain = 1: scale = (1 + r²  - 2r·cos(2w0)) is close
+    // but simplest to just leave it; the DC-gain difference is tiny for high Q.
+    nf.x1 = nf.x2 = nf.y1 = nf.y2 = 0.0f;
+    g_nNotch++;
+  }
+}
+
+// Process one sample through the entire notch chain.
+// Input/output are float centered around 0 (DC removed before, added after).
+static inline float applyNotch(float x) {
+  for (int i = 0; i < g_nNotch; i++) {
+    Biquad &nf = g_notch[i];
+    float y = nf.b0 * x + nf.b1 * nf.x1 + nf.b2 * nf.x2
+                         - nf.a1 * nf.y1 - nf.a2 * nf.y2;
+    nf.x2 = nf.x1; nf.x1 = x;
+    nf.y2 = nf.y1; nf.y1 = y;
+    x = y;
+  }
+  return x;
 }
 
 // Quick batch stats so the mic can be verified from the serial log alone,
@@ -382,6 +435,9 @@ void setup() {
   Serial.printf("[boot] rate=%dHz batch=%dms (%u samples / %u bytes)\n",
                 SAMPLE_RATE_HZ, BATCH_MS, (unsigned)BATCH_SAMPLES,
                 (unsigned)(BATCH_SAMPLES * 2));
+  initNotchFilters();
+  Serial.printf("[boot] notch filters: %d x 50Hz harmonics (Q=%d)\n",
+                g_nNotch, NOTCH_Q);
 
   connectWiFi();
 
